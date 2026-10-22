@@ -7,6 +7,7 @@ from datetime import date, timedelta
 
 from etl.config import DENOMINATION_DATE, Settings
 from etl.extract import CbarClient
+from etl.transform import Transformer
 
 log = logging.getLogger("etl.main")
 
@@ -59,13 +60,20 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     client = CbarClient(settings)
-    total_bytes = sum(len(bulletin.content) for bulletin in client.fetch_range(start, end))
-    stats = client.stats
+    transformer = Transformer()
+    bulletins = list(transformer.transform(client.fetch_range(start, end)))
 
-    log.info("Downloaded %d/%d days (%.1f KB) in %.1fs",
-             stats.downloaded, stats.requested, total_bytes / 1024, time.perf_counter() - started)
-    if stats.failed_dates:
-        log.error("Failed days: %s", ", ".join(map(str, stats.failed_dates)))
+    extracted, transformed = client.stats, transformer.stats
+    log.info("Downloaded %d/%d days", extracted.downloaded, extracted.requested)
+    log.info("%d unique bulletins (%d rates), %d duplicates (weekends/holidays), "
+             "%d rejected, %d rows skipped",
+             transformed.bulletins, transformed.rows, transformed.duplicates,
+             transformed.rejected, transformed.skipped_rows)
+    if bulletins:
+        log.info("Bulletin dates: %s -> %s", bulletins[0].rate_date, bulletins[-1].rate_date)
+    log.info("Finished in %.1fs", time.perf_counter() - started)
+    if extracted.failed_dates:
+        log.error("Failed days: %s", ", ".join(map(str, extracted.failed_dates)))
         return 1
     return 0
 
