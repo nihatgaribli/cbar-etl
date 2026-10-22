@@ -1,12 +1,14 @@
 # CBAR AZN Exchange Rates — ETL Pipeline
 
-An end-to-end data engineering project that **extracts** the official daily exchange rates of the
+An end-to-end data engineering project. It **extracts** the official daily exchange rates of the
 Azerbaijani manat (AZN) from the Central Bank of the Republic of Azerbaijan (CBAR), **transforms** and
-validates them with Python, **loads** them into PostgreSQL, and exposes **SQL analytics** on top —
-all reproducible with a single `docker compose up`.
+validates them with Python, **loads** them into PostgreSQL, and serves **SQL analytics** and a
+**dashboard** on top. Everything is reproducible with `docker compose up`.
 
-> Course: *Practicum: Data Engineering with Python (Git, Docker, SQL)* — AzTU, Master's program
-> Status: 🚧 in development — see [Roadmap](#roadmap)
+> Course: *Practicum: Data Engineering with Python (Git, Docker, SQL)*, AzTU, Master's program
+> Status: ✅ complete (`v1.0.0`), see [Roadmap](#roadmap)
+
+![Dashboard](docs/dashboard.png)
 
 ---
 
@@ -17,44 +19,48 @@ all reproducible with a single `docker compose up`.
 3. [Data source: CBAR API](#data-source-cbar-api)
 4. [Data model](#data-model)
 5. [Pipeline logic](#pipeline-logic)
-6. [Project structure](#project-structure)
-7. [Getting started](#getting-started)
-8. [Usage](#usage)
-9. [SQL analytics](#sql-analytics)
-10. [Testing](#testing)
-11. [Git workflow](#git-workflow)
-12. [Roadmap](#roadmap)
+6. [Design decisions](#design-decisions)
+7. [Project structure](#project-structure)
+8. [Getting started](#getting-started)
+9. [Usage](#usage)
+10. [SQL analytics](#sql-analytics)
+11. [Results](#results)
+12. [Dashboard](#dashboard)
+13. [Testing](#testing)
+14. [Git workflow](#git-workflow)
+15. [Roadmap](#roadmap)
 
 ---
 
 ## Architecture
 
 ```text
-                ┌──────────────────────────────── docker compose ───────────────────────────────┐
-                │                                                                               │
- cbar.az  ──────┼──► Extract ──► Transform ──► Load ──────────► PostgreSQL 16 ◄──── SQL analytics │
- (daily XML)    │    requests    validation    psycopg           (volume)            (views)      │
-                │    + retry     + pandas      UPSERT                │                            │
-                │                                                    └──────► Streamlit dashboard │
-                │                 etl service                                 (optional)        │
-                └───────────────────────────────────────────────────────────────────────────────┘
+             ┌───────────────────────────── docker compose ─────────────────────────────┐
+             │                                                                          │
+ cbar.az ────┼─► Extract ──► Transform ──► Load ─────────► PostgreSQL 17 ◄── SQL views  │
+ daily XML   │   requests    XML parsing   psycopg 3        (named volume)       │       │
+             │   retry       validation    batch UPSERT          ▲               ▼       │
+             │   backoff     de-dup        run log               │        Streamlit      │
+             │                                                   │        dashboard      │
+             │   etl service (one-shot job)                      │        :8501          │
+             └───────────────────────────────────────────────────┴──────────────────────┘
 ```
 
-Every run is logged to the `etl_runs` table, and the pipeline is **idempotent**: running it twice over
-the same date range leaves the database unchanged.
+Every run is recorded in the `etl_runs` table. The pipeline is **idempotent**: a second run over the
+same dates writes nothing.
 
 ## Tech stack
 
-| Area           | Tools                                                     |
-|----------------|-----------------------------------------------------------|
-| Language       | Python 3.12                                               |
-| Extract        | `requests` (session, timeout, retry with backoff)         |
-| Transform      | `xml.etree.ElementTree`, `pandas`                         |
-| Load           | `psycopg` 3, PostgreSQL 16                                |
-| Orchestration  | Docker, Docker Compose                                    |
-| Quality        | `pytest`, `ruff`, GitHub Actions                          |
-| Visualization  | Streamlit *(optional)*                                    |
-| Version control| Git, GitHub (feature branches, Conventional Commits)      |
+| Area            | Tools                                                        |
+|-----------------|--------------------------------------------------------------|
+| Language        | Python 3.12                                                  |
+| Extract         | `requests`: session, timeout, retry with exponential backoff |
+| Transform       | `xml.etree.ElementTree`, `decimal.Decimal`, dataclasses      |
+| Load            | `psycopg` 3, PostgreSQL 17                                   |
+| Containers      | Docker, Docker Compose                                       |
+| Quality         | `pytest` (unit and integration), `ruff`, GitHub Actions      |
+| Dashboard       | Streamlit, Altair, pandas                                    |
+| Version control | Git: feature branches, Conventional Commits, release tags    |
 
 ---
 
@@ -98,24 +104,21 @@ No API key, no authentication, no registration.
 
 ### API behaviour verified before development
 
-The endpoint was probed on **2026-10-22** ([`scripts/probe_cbar_api.py`](scripts/probe_cbar_api.py)).
-These findings drive the design of the pipeline:
+The endpoint was probed on **2026-10-22** with [`scripts/probe_cbar_api.py`](scripts/probe_cbar_api.py).
+Each finding below shaped the pipeline:
 
 | # | Finding | Evidence | How the pipeline handles it |
 | --- | --- | --- | --- |
-| 1 | **Weekends, holidays and future dates return the *last published* bulletin**, not an error | Request `18.10.2026` (Sun) → `ValCurs Date="16.10.2026"` (Fri). Request `21.11.2026` → latest bulletin | The authoritative date is the **`ValCurs/@Date` attribute**, never the requested date. Bulletins are de-duplicated by that date |
-| 2 | **Invalid requests still return HTTP 200**, but with an HTML page | `31.02.2026`, `2026-10-21`, `abc`, `15.06.1990` → `200 text/html`, 141 KB | Validate `Content-Type` contains `xml` **and** the root tag is `ValCurs`; otherwise raise `InvalidResponseError` |
-| 3 | **Three kinds of `Nominal`**: `1`, `100` (JPY, RUB, KZT, KRW, HUF, UZS, PKR) and `1 t.u.` (troy ounce, bank metals). Historical files also contain `10000` | Today: 31 × `1`, 7 × `100`, 4 × `1 t.u.` | Parse the leading integer, store `nominal` and compute `rate_per_unit = value / nominal`. Metals get unit `troy_ounce` |
-| 4 | **Two categories** under `ValType`: `Xarici valyutalar` (38 currencies) and `Bank metalları` (4 metals: XAU, XAG, XPT, XPD) | 42 rows per bulletin | Stored as `category` = `currency` / `metal` |
-| 5 | **Empty `Value`** in old bulletins (metals in 2000 and 2005) | `<Value></Value>` for XPD on 09.03.2005 | Row is skipped and counted in `rows_skipped` |
+| 1 | **Weekends, holidays and future dates return the *last published* bulletin** instead of an error | Request `18.10.2026` (Sun) → `ValCurs Date="16.10.2026"` (Fri). Request `21.11.2026` → latest bulletin | The authoritative date is the **`ValCurs/@Date` attribute**, never the requested date. Bulletins are de-duplicated by that date |
+| 2 | **Invalid requests still return HTTP 200**, with an HTML page as the body | `31.02.2026`, `2026-10-21`, `abc`, `15.06.1990` → `200 text/html`, 141 KB | The response must have an XML `Content-Type` **and** a `ValCurs` root, otherwise `InvalidResponseError` |
+| 3 | **Three kinds of `Nominal`**: `1`, `100` (JPY, RUB, KZT, KRW, HUF, UZS, PKR) and `1 t.u.` (troy ounce, bank metals). Historical files also contain `10000` | Today: 31 × `1`, 7 × `100`, 4 × `1 t.u.` | The leading integer is stored as `nominal`, and `rate_per_unit = value / nominal`. Metals get unit `troy_ounce` |
+| 4 | **Two categories** under `ValType`: `Xarici valyutalar` (38 currencies) and `Bank metalları` (4 metals: XAU, XAG, XPT, XPD) | 42 rows per bulletin | Stored as `category` = `currency` / `metal`. An unknown section rejects the bulletin |
+| 5 | **Empty `Value`** in old bulletins (metals in 2000, 2005 and early 2006) | `<Value></Value>` for XPD on 09.03.2005 | The row is skipped and counted in `rows_skipped` |
 | 6 | **Manat denomination (2006): pre-2006 values are in old manat** (1 new AZN = 5000 old AZM) | USD `4593` on 30.12.2005 vs `0.8963` on 15.06.2006. Request `03.01.2006` still returns the `30.12.2005` bulletin | Bulletins with `ValCurs/@Date < 2006-01-01` are rejected. The check uses the **bulletin date**, not the requested date |
-| 7 | **The currency list changes over time** | Since 2010 ARS, BRL, EGP, IDR, IRR, LBP, MXN, TJS, ZAR were removed and CZK, HUF, PKR, QAR, RON, RSD were added | The `currencies` dimension is upserted dynamically, with `first_seen` / `last_seen` |
-| 8 | **Data availability**: from 1994. Usable range for this project: **2006 → today** | 1992–1993 → HTML; 1994 → 21 rows | `--from` earlier than 2006-01-01 is rejected by the CLI |
-| 9 | **No rate limiting observed**. 30 sequential requests → 30 × HTTP 200 in ~3.5 s. `Cache-Control: no-store` | burst test | A polite 0.2 s delay between requests, a 15 s timeout and 3 retries with exponential backoff (network errors and 5xx) |
-| 10 | Encoding is UTF-8 with Azerbaijani characters (`ə`, `ü`, `ş`) | `Name="AZN məzənnələri"` | Parse bytes (`response.content`) with the XML parser, not `response.text` |
-
-Useful historical events for analysis: the AZN devaluations on **21.02.2015** (USD 0.7862 → 1.0500) and
-**21.12.2015** (USD 1.0499 → 1.5500, transition to a floating rate).
+| 7 | **The currency list changes over time** | Since 2010, ARS, BRL, EGP, IDR, IRR, LBP, MXN, TJS and ZAR were removed, and CZK, HUF, PKR, QAR, RON and RSD were added | The `currencies` dimension is upserted dynamically, with `first_seen` / `last_seen` |
+| 8 | **Data availability**: from 1994. Usable range for this project: **2006 → today** | 1992–1993 → HTML. 1994 → 21 rows | The CLI rejects `--from` earlier than 2006-01-01 |
+| 9 | **No rate limiting observed**: 30 sequential requests gave 30 × HTTP 200 in ~3.5 s. `Cache-Control: no-store` | Burst test | A polite 0.2 s delay between requests, a 15 s timeout and 3 retries with exponential backoff (network errors and 5xx only) |
+| 10 | Encoding is UTF-8 with Azerbaijani characters (`ə`, `ü`, `ş`) | `Name="AZN məzənnələri"` | The XML parser reads raw bytes (`response.content`), not `response.text` |
 
 ---
 
@@ -125,28 +128,35 @@ Useful historical events for analysis: the AZN devaluations on **21.02.2015** (U
 ┌──────────────────────────┐        ┌──────────────────────────────────┐
 │ currencies               │        │ exchange_rates                   │
 ├──────────────────────────┤        ├──────────────────────────────────┤
-│ code        CHAR(3)  PK  │◄───────│ currency_code CHAR(3)  PK, FK    │
-│ name_az     TEXT         │        │ rate_date     DATE     PK        │
+│ code        CHAR(3)  PK  │◄───────│ currency_code CHAR(3)   PK, FK   │
+│ name_az     TEXT         │        │ rate_date     DATE      PK       │
 │ category    TEXT         │        │ nominal       INTEGER            │
 │ unit        TEXT         │        │ value         NUMERIC(18,6)      │
 │ first_seen  DATE         │        │ rate_per_unit NUMERIC(20,10)     │
-│ last_seen   DATE         │        │               (generated)        │
+│ last_seen   DATE         │        │               GENERATED STORED   │
 └──────────────────────────┘        │ loaded_at     TIMESTAMPTZ        │
                                     └──────────────────────────────────┘
-┌──────────────────────────────────────────────┐
-│ etl_runs                                     │
-├──────────────────────────────────────────────┤
-│ run_id, started_at, finished_at, status,     │
-│ date_from, date_to, days_requested,          │
-│ bulletins_loaded, rows_upserted,             │
-│ rows_skipped, error_message                  │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│ currency_redenominations   (reference)   │
+├──────────────────────────────────────────┤
+│ currency_code PK, effective_date,        │
+│ factor, note    -- BYN 2016, TMT 2009    │
+└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ etl_runs                                                 │
+├──────────────────────────────────────────────────────────┤
+│ run_id, status (running | success | partial | failed),   │
+│ started_at, finished_at, date_from, date_to,             │
+│ days_requested, days_failed, bulletins_loaded,           │
+│ duplicates, rejected, rows_inserted, rows_updated,       │
+│ rows_unchanged, rows_skipped, error_message              │
+└──────────────────────────────────────────────────────────┘
 ```
 
-- `category`: `currency` | `metal`
-- `unit`: `unit` | `troy_ounce`
-- `rate_per_unit` is a generated column: `value / nominal`
-- Index on `exchange_rates (currency_code, rate_date)` for time-series queries
+- `CHECK` constraints guard codes (`^[A-Z]{3}$`), categories, units, positive values and the
+  2006 lower bound for `rate_date`
+- The primary key `(currency_code, rate_date)` serves per-currency time series. A second index on
+  `rate_date` serves per-day lookups
 
 DDL: [`sql/01_schema.sql`](sql/01_schema.sql)
 
@@ -155,21 +165,47 @@ DDL: [`sql/01_schema.sql`](sql/01_schema.sql)
 ## Pipeline logic
 
 ```text
-for each calendar day in [date_from, date_to]:
-    response = GET /currencies/{day}.xml         (retry ×3, timeout 15 s)
-    assert response is XML with root <ValCurs>   (finding #2)
-    bulletin_date = ValCurs/@Date                (finding #1)
-    if bulletin_date already seen → skip         (weekends/holidays)
-    if bulletin_date < 2006-01-01 → reject       (finding #6)
-    parse rows: code, category, nominal, value   (findings #3, #4)
-    drop rows with empty value                   (finding #5)
+apply sql/01_schema.sql and sql/02_views.sql           (idempotent DDL)
+INSERT etl_runs (status = running)                     (committed at once)
 
-upsert currencies      ON CONFLICT (code) DO UPDATE last_seen
-upsert exchange_rates  ON CONFLICT (currency_code, rate_date) DO UPDATE
-write a row to etl_runs (success / failed)
+BEGIN
+  for each calendar day in [date_from, date_to]:
+      GET /currencies/{day}.xml                        retry ×3 on network errors / 5xx
+      require XML with a <ValCurs> root                finding #2, else the day is logged as failed
+      bulletin_date = ValCurs/@Date                    finding #1
+      skip if bulletin_date already seen in this run   weekends / holidays
+      reject if bulletin_date < 2006-01-01             finding #6
+      parse rows; skip empty or invalid values         findings #3, #4, #5
+  every 100 bulletins:
+      UPSERT currencies       (first_seen = LEAST, last_seen = GREATEST)
+      UPSERT exchange_rates   (rewrite only rows whose values changed)
+COMMIT                                                 or ROLLBACK on any error
+
+UPDATE etl_runs: status, counters, error_message
 ```
 
-One transaction per run, so a failure rolls back the whole batch and is still recorded in `etl_runs`.
+Run status: `success`, or `partial` when some days failed to download (the rest is still loaded), or
+`failed` when an exception rolled the whole batch back. The process exit code is 0 / 1 / 2.
+
+---
+
+## Design decisions
+
+| Decision | Why |
+| --- | --- |
+| `Decimal` in Python, `NUMERIC` in SQL | Binary floats cannot represent `1.7` exactly. Money-like values must not drift |
+| Bulletin date from `ValCurs/@Date` | The requested date is wrong for weekends and holidays (finding #1) |
+| `INSERT … SELECT FROM unnest(arrays)` | One round trip per batch of ~4,200 rows instead of 4,200 statements |
+| `ON CONFLICT … DO UPDATE … WHERE … IS DISTINCT FROM` | A re-run does not touch unchanged rows, so `loaded_at` keeps its meaning and the run log can count *inserted / updated / unchanged* (`RETURNING xmax = 0`) |
+| One transaction per run, run log outside it | Data is all-or-nothing, but failed runs remain visible in `etl_runs` |
+| Generated column `rate_per_unit` | Prices quoted per 100 units (RUB, JPY, …) become directly comparable, and the formula exists in one place only |
+| Schema and views applied on every run | No separate migration step. All DDL is `IF NOT EXISTS` / `CREATE OR REPLACE` |
+| `RANGE BETWEEN INTERVAL '6 days' PRECEDING` | A "7-day" average really covers 7 calendar days, even across weekends and holidays |
+| `TZ=Asia/Baku` in containers | CBAR publishes by Baku time. In UTC, "today" is wrong between 00:00 and 04:00 |
+| Non-root containers, slim base image | Smaller attack surface |
+
+Known limitation: two runs at the same time are serialized. `CREATE INDEX IF NOT EXISTS` waits for
+the other run's open transaction, so the second run starts when the first one commits.
 
 ---
 
@@ -178,34 +214,41 @@ One transaction per run, so a failure rolls back the whole batch and is still re
 ```text
 .
 ├── README.md
-├── docker-compose.yml          # postgres + etl (+ dashboard)
+├── docker-compose.yml          # postgres + etl (one-shot) + dashboard
 ├── Dockerfile                  # ETL image
+├── .dockerignore
 ├── .env.example                # copy to .env
 ├── .gitignore
 ├── .gitattributes              # LF line endings (Windows ↔ Linux containers)
 ├── pyproject.toml              # ruff + pytest configuration
-├── requirements.txt
+├── requirements.txt            # ETL runtime
 ├── requirements-dev.txt        # pytest, ruff
+├── .github/workflows/ci.yml    # lint, tests with PostgreSQL, image builds
+├── .streamlit/config.toml      # dashboard theme
 ├── etl/
-│   ├── __init__.py
 │   ├── config.py               # settings from environment variables
-│   ├── extract.py              # HTTP client: retry, validation
-│   ├── transform.py            # XML → validated records
-│   ├── load.py                 # PostgreSQL upserts, run log
-│   └── main.py                 # CLI entry point
+│   ├── extract.py              # HTTP client: retry, backoff, response validation
+│   ├── transform.py            # XML → validated, de-duplicated records
+│   ├── load.py                 # schema, batch upserts, run log
+│   └── main.py                 # CLI and pipeline orchestration
 ├── sql/
-│   ├── 01_schema.sql           # tables, indexes (auto-run by Postgres on first start)
-│   └── 02_analytics.sql        # views and analytical queries
+│   ├── 01_schema.sql           # tables, constraints, indexes
+│   ├── 02_views.sql            # analytical views
+│   └── 03_analysis.sql         # report queries (run manually)
+├── dashboard/
+│   ├── app.py                  # Streamlit app
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── scripts/
 │   └── probe_cbar_api.py       # API behaviour probe (see findings table)
 ├── tests/
 │   ├── fixtures/               # real CBAR XML bulletins
-│   ├── test_extract.py
-│   ├── test_main.py            # CLI argument validation
-│   └── test_transform.py
-├── dashboard/                  # optional
-│   └── app.py
-└── .github/workflows/ci.yml    # lint + tests on every push
+│   ├── test_extract.py         # unit: HTTP, retries, validation
+│   ├── test_transform.py       # unit: parsing and data rules
+│   ├── test_main.py            # unit: CLI arguments
+│   └── test_load.py            # integration: PostgreSQL, views, full pipeline
+└── docs/
+    └── dashboard.png
 ```
 
 ---
@@ -214,67 +257,77 @@ One transaction per run, so a failure rolls back the whole batch and is still re
 
 ### Prerequisites
 
-- Docker Desktop (Compose v2)
+- Docker Desktop (Compose v2.24+)
 - Git
-- *(for local development only)* Python 3.12+
+- *(local development only)* Python 3.12+
 
-### Run with Docker
+### Run everything with Docker
 
 ```bash
 git clone https://github.com/<your-username>/cbar-etl.git
 cd cbar-etl
-cp .env.example .env            # adjust passwords if needed
-docker compose up -d postgres   # schema is created automatically
-docker compose run --rm etl     # load the last 30 days
+cp .env.example .env                        # optional: defaults work out of the box
+docker compose up -d --build                # postgres + dashboard; etl loads the last 30 days
+docker compose run --rm etl --from 2006-01-01   # optional: full history (~40 min, ~235k rows)
 ```
 
-### Run locally (development)
+Then open the dashboard at **<http://localhost:8501>**.
+
+### Local development
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate                   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt -r requirements-dev.txt
 docker compose up -d postgres
 python -m etl.main --days 30
+pytest -v
 ```
 
 ### Environment variables
 
-| Variable            | Default       | Description                      |
-|---------------------|---------------|----------------------------------|
-| `POSTGRES_USER`     | `etl`         | Database user                    |
-| `POSTGRES_PASSWORD` | `etl`         | Database password                |
-| `POSTGRES_DB`       | `cbar`        | Database name                    |
-| `POSTGRES_HOST`     | `postgres`    | `localhost` when running locally |
-| `POSTGRES_PORT`     | `5432`        | Database port                    |
-| `REQUEST_DELAY`     | `0.2`         | Seconds between API requests     |
-| `LOG_LEVEL`         | `INFO`        | Python logging level             |
+| Variable            | Default                          | Description                                    |
+|---------------------|----------------------------------|------------------------------------------------|
+| `POSTGRES_USER`     | `etl`                            | Database user                                  |
+| `POSTGRES_PASSWORD` | `etl`                            | Database password                              |
+| `POSTGRES_DB`       | `cbar`                           | Database name                                  |
+| `POSTGRES_HOST`     | `localhost`                      | Compose sets it to `postgres` inside containers |
+| `POSTGRES_PORT`     | `5432`                           | Database port (also the published host port)   |
+| `DASHBOARD_PORT`    | `8501`                           | Published dashboard port                       |
+| `CBAR_BASE_URL`     | `https://www.cbar.az/currencies` | API base URL                                   |
+| `REQUEST_TIMEOUT`   | `15`                             | Seconds per HTTP request                       |
+| `REQUEST_DELAY`     | `0.2`                            | Seconds between requests                       |
+| `MAX_RETRIES`       | `3`                              | Retries on network errors and 5xx              |
+| `RETRY_BACKOFF`     | `1.0`                            | First backoff in seconds (doubles each retry)  |
+| `LOG_LEVEL`         | `INFO`                           | Python logging level                           |
 
 ---
 
 ## Usage
 
 ```bash
-# last N days (default 30)
-python -m etl.main --days 90
-
-# explicit range (dates in ISO format)
+python -m etl.main                          # last 30 days
+python -m etl.main --days 90                # last 90 days
 python -m etl.main --from 2015-01-01 --to 2015-12-31
-
-# in Docker
-docker compose run --rm etl --from 2024-01-01 --to 2024-12-31
+docker compose run --rm etl --from 2024-01-01   # the same, inside Docker
 ```
 
-Example output:
+Example: the first run, then the same command again.
 
 ```text
-2026-10-22 14:02:11 INFO  extract   Requesting 30 days: 2026-09-23 → 2026-10-22
-2026-10-22 14:02:17 INFO  transform 22 unique bulletins, 8 duplicates (weekends/holidays) skipped
-2026-10-22 14:02:17 INFO  load      924 rows upserted, 0 skipped
-2026-10-22 14:02:17 INFO  main      Run #3 finished: success (6.1 s)
+INFO    etl.main     Run #1 started
+INFO    etl.extract  Requesting 30 days: 2026-09-23 -> 2026-10-22
+INFO    etl.load     Loaded 22 bulletins up to 2026-10-22
+INFO    etl.main     Downloaded 30/30 days
+INFO    etl.main     22 unique bulletins, 8 duplicates (weekends/holidays), 0 rejected, 0 rows skipped
+INFO    etl.main     Rows: 924 inserted, 0 updated, 0 unchanged
+INFO    etl.main     Run #1 finished: success (10.3s)
+...
+INFO    etl.main     Rows: 0 inserted, 0 updated, 924 unchanged
+INFO    etl.main     Run #2 finished: success (10.4s)
 ```
 
-Connect to the database:
+Open a SQL shell:
 
 ```bash
 docker compose exec postgres psql -U etl -d cbar
@@ -284,61 +337,154 @@ docker compose exec postgres psql -U etl -d cbar
 
 ## SQL analytics
 
-Defined in [`sql/02_analytics.sql`](sql/02_analytics.sql):
+Views in [`sql/02_views.sql`](sql/02_views.sql), re-created on every run:
 
-| View / query            | Technique                          | Question it answers                                  |
-|-------------------------|------------------------------------|------------------------------------------------------|
-| `v_latest_rates`        | `DISTINCT ON`                      | What are today's official rates?                     |
-| `v_daily_change`        | `LAG()` window function            | How much did each currency move day over day (%)?    |
-| `v_moving_avg_7d`       | `AVG() OVER (ROWS 6 PRECEDING)`    | What is the smoothed trend?                          |
-| `v_monthly_summary`     | `GROUP BY date_trunc`, `FIRST/LAST`| Monthly open / close / min / max                     |
-| Volatility ranking      | `STDDEV()` of daily returns, `RANK()` | Which currency is the most volatile?              |
-| Shock detection         | CTE + filter `abs(change) > 10%`   | Find devaluation days (e.g. 2015)                    |
-| Cross rates             | self-join                          | EUR/USD, gold price in USD derived from AZN rates    |
+```text
+exchange_rates (raw, as published)
+   └─► v_rate_checks    redenomination-adjusted rate + spike detection (LAG/LEAD 3 and 10)
+         ├─► v_clean_rates    suspect rows removed; all analytical views read from here
+         └─► v_suspect_rates  the removed rows, for data-quality review
+```
+
+| View                  | Technique                                          | Question it answers                                    |
+|-----------------------|----------------------------------------------------|--------------------------------------------------------|
+| `v_rate_checks`       | `LAG/LEAD(x, k)`, `LEFT JOIN` reference table      | Is this rate an isolated spike? What is it in today's units? |
+| `v_daily_change`      | `LAG()` over a named `WINDOW`                      | How much did each currency move since the previous bulletin? |
+| `v_latest_rates`      | view on a view, scalar subquery                    | What are the current official rates?                   |
+| `v_moving_averages`   | `AVG() OVER (RANGE BETWEEN INTERVAL … PRECEDING)`  | 7-day and 30-day calendar trends                       |
+| `v_monthly_summary`   | `ARRAY_AGG(… ORDER BY …)[1]`, `GROUP BY`           | Monthly open / high / low / close                      |
+| `v_yearly_volatility` | `STDDEV_SAMP`, `RANK() OVER (PARTITION BY year)`   | Which currency was the most volatile each year?        |
+| `v_shocks`            | filter on window results                           | Days with a move of 5 % or more                        |
+| `v_usd_cross_rates`   | self-join                                          | Prices in USD, e.g. EUR/USD or gold per ounce          |
+| `v_etl_runs`          | interval arithmetic                                | Pipeline monitoring                                    |
+
+Report queries in [`sql/03_analysis.sql`](sql/03_analysis.sql) (CTEs, `FILTER`, `DISTINCT ON`,
+`HAVING`, window functions on aggregates):
+
+```bash
+docker compose exec -T postgres psql -U etl -d cbar < sql/03_analysis.sql
+```
+
+---
+
+## Results
+
+Full backfill **2006-01-01 → 2026-10-22**: 7,600 days requested in one run (42 min, status
+`success`).
+
+| Metric | Value |
+| --- | --- |
+| Rates loaded | **235,488** rows, 23 MB |
+| Bulletins | 5,267 unique (2,330 weekend/holiday repeats skipped) |
+| Currencies and metals | 55 codes over time (42 published today) |
+| Rejected | 3 old-manat bulletins (1–3 Jan 2006), 94 rows with empty values |
+
+### What the data shows
+
+- **The manat's three regimes.** From 2006 to 2014 the manat appreciated slowly
+  (USD 0.89 → 0.78 AZN). In **2015** it was devalued twice: **+33.6 %** on 21.02.2015 (0.7862 → 1.0500)
+  and **+47.6 %** on 21.12.2015 (1.0499 → 1.5500), so the dollar ended the year **+98.8 %** higher.
+  After a floating period (1.49–1.92 in 2016–2017), the rate has stayed at **1.7000 (±0.0001) since
+  24.11.2017**
+- **Gold.** 550.72 AZN per troy ounce at the end of 2006, and 7,419.31 at the end of 2025 (×13.5).
+  In USD the rise is only ×6.9 (632 → 4,364): the other half is the manat's devaluation
+- **2026 year to date.** KZT is the strongest (+13.0 % against AZN), TRY the weakest
+  currency (−13.2 %). Precious metals are falling sharply: palladium −36.6 %, platinum −27.3 %,
+  silver −25.4 %, gold −7.1 %
+- **Volatility over the last 365 days.** RUB is the most volatile (σ of daily change 0.87 %),
+  followed by HUF (0.74 %) and BYN (0.66 %). USD is at 0 because of the peg
+- **EUR/USD derived through AZN** matches the market history: the yearly average peaked at
+  1.4710 in 2008 and bottomed at 1.0521 in 2022
+
+### Data quality findings
+
+Loading 20 years of history found problems that a 30-day sample never shows:
+
+| Finding | Scale | Handling |
+| --- | --- | --- |
+| **Isolated errors in CBAR's archive.** On 04.07.2007, 20 currencies carry their neighbour's value (e.g. KZT 0.5132 = GEL's rate). DKK = 1567 instead of 0.1567 on 14.08.2015. XAG, XPD and XPT are swapped on 5 days in April 2009 | 86 rows, 30 currencies, 46 bulletins (0.037 %) | Raw data is kept as published. `v_rate_checks` flags them, analytics reads `v_clean_rates`, and the rows can be reviewed in `v_suspect_rates` |
+| **Redenominations under an unchanged code.** BYN on 01.07.2016 (10,000:1) and TMT on 13.01.2009 (5,000:1) | Without handling: day-over-day moves of +996,523 % and +248,927 % | `currency_redenominations` reference table. The real moves are −0.34 % and +0.50 % |
+| **Quoting nominal changed** for RUB, KZT, BYN, TMT and IRR (e.g. RUB per 1 → per 100 on 18.11.2024) | 5 currencies | `rate_per_unit = value / nominal` makes the series continuous |
+| **13 currencies were discontinued** (11 of them on 16.11.2024: ARS, BRL, MXN, …) | 13 currencies | `currencies.last_seen` |
+| **Gaps of 10–13 days** every March | Novruz holidays | Expected. The views compare bulletins, not calendar days |
+
+Large moves that remain in `v_shocks` are mostly genuine: Lebanon's official-rate change (LBP −90 %,
+02.02.2023), Argentina's devaluation (ARS −54 %, 14.12.2023) and the 2015 AZN devaluations. A few
+long-lasting jumps (e.g. KGS in October 2010) look like source errors as well. They last longer
+than the 10-bulletin detection window, so the pipeline cannot tell them apart from a real level
+change, and they are deliberately not removed.
+
+---
+
+## Dashboard
+
+`docker compose up -d dashboard` → <http://localhost:8501>
+
+- **Headline tiles**: USD, EUR, 100 RUB and gold, with the change since the previous bulletin and a
+  45-day sparkline
+- **Compare currencies**: up to 8 currencies. *Indexed* mode puts all of them on one axis
+  (start = 100). *AZN per unit* mode shows real prices as small multiples, one chart per currency,
+  so no chart needs two y-axes
+- **USD since 2006**: the full history with the 2015 devaluations marked
+- **Volatility ranking** of the last 365 days, the **full rates table** and the **pipeline run log**
+
+Each chart has a hover tooltip and a "Show data" table. Each currency keeps a fixed color, and
+the palette was checked for color-vision deficiency in both light and dark themes.
 
 ---
 
 ## Testing
 
 ```bash
-pytest -v
+pytest -v          # 75 tests
 ruff check .
 ```
 
-Unit tests use saved XML fixtures, so they do **not** call the real API:
+| Suite               | Kind        | Covers                                                                    |
+|---------------------|-------------|---------------------------------------------------------------------------|
+| `test_extract.py`   | unit        | URL format, HTML-with-200 rejection, retry/backoff timing, 4xx without retry, range iteration |
+| `test_transform.py` | unit        | real bulletins (42 rows), nominals, `Decimal` precision, empty values, old manat, de-duplication |
+| `test_main.py`      | unit        | CLI defaults and every invalid argument combination                       |
+| `test_load.py`      | integration | idempotent reload, updates, rollback, run log, every view, redenominations, spike detection vs. genuine level shifts, full pipeline with a fake CBAR server |
 
-- normal bulletin → 42 records with correct `rate_per_unit`
-- `Nominal = 100` and `1 t.u.` parsing
-- HTML response → `InvalidResponseError`
-- empty `<Value>` → row skipped
-- pre-2006 bulletin → rejected
-- duplicate bulletin date → de-duplicated
+Unit tests never touch the network. Integration tests run against a real PostgreSQL, each in its
+own throw-away schema. Without a database they are skipped locally, but in CI `REQUIRE_DB=1` turns
+a missing database into a failure.
 
 ---
 
 ## Git workflow
 
-- `main` always works. Every feature is developed on a branch: `feature/extract`,
-  `feature/transform`, `feature/load`, `feature/docker`, `feature/sql-analytics`, `feature/dashboard`
+- `main` always works. Every phase was built on its own branch and merged with `--no-ff`, so
+  `git log --graph` shows the history phase by phase:
+  `feature/extract`, `feature/transform`, `feature/load`, `feature/docker`,
+  `feature/sql-analytics`, `feature/dashboard`, `feature/ci`, `fix/dashboard-polish`,
+  `fix/redenominations`, `fix/dashboard-theme`, `docs/final-readme`
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
-  `feat: add retry with backoff to extractor`, `fix: handle empty Value tag`, `docs: ...`, `test: ...`
-- Merge with `git merge --no-ff` so the history shows each feature
-- Release tags: `v0.1.0` (extract), `v0.5.0` (DB load), `v1.0.0` (final)
-- Secrets (`.env`) are never committed. `.env.example` is committed instead
+  `feat:`, `fix:`, `ci:`, `docs:`, `chore:`
+- Release tags: `v0.1.0` (extract), `v0.5.0` (database load), `v1.0.0` (final)
+- Secrets (`.env`) are never committed. `.env.example` documents them
+
+```bash
+git log --graph --oneline --all
+```
 
 ---
 
 ## Roadmap
 
-- [x] **Phase 1 — API research.** Endpoint probing, edge cases, findings table
-- [x] **Phase 0 — Setup.** Git repo, `.gitignore`, `.env.example`, `requirements.txt`, virtualenv
-- [x] **Phase 2 — Extract.** HTTP session, timeout, retry/backoff, response validation, logging, CLI
-- [ ] **Phase 3 — Transform.** XML parsing, nominal normalization, de-duplication, denomination guard, unit tests
-- [ ] **Phase 4 — Load.** `01_schema.sql`, psycopg upserts, transactions, `etl_runs` log, idempotency check
-- [ ] **Phase 5 — Docker.** `Dockerfile`, `docker-compose.yml`, healthcheck, named volume, init scripts
-- [ ] **Phase 6 — SQL analytics.** Views and analytical queries, historical backfill 2015 → today
-- [ ] **Phase 7 — Dashboard** *(optional)*. Streamlit charts on top of the views
-- [ ] **Phase 8 — Polish.** GitHub Actions CI, final README, screenshots, `v1.0.0` tag
+- [x] **Phase 1, API research.** Endpoint probing, edge cases, findings table
+- [x] **Phase 0, Setup.** Git repo, `.gitignore`, `.env.example`, `requirements.txt`, virtualenv
+- [x] **Phase 2, Extract.** HTTP session, timeout, retry/backoff, response validation, logging, CLI
+- [x] **Phase 3, Transform.** XML parsing, nominal normalization, de-duplication, denomination guard, unit tests
+- [x] **Phase 4, Load.** Schema, batch upserts, transactions, `etl_runs` log, idempotency, integration tests
+- [x] **Phase 5, Docker.** `Dockerfile`, `docker-compose.yml`, healthcheck, named volume, timezone
+- [x] **Phase 6, SQL analytics.** Views, report queries, historical backfill 2006 → today, data-quality layer
+- [x] **Phase 7, Dashboard.** Streamlit + Altair on top of the views
+- [x] **Phase 8, Polish.** GitHub Actions CI, final README, screenshot, `v1.0.0` tag
+
+Possible next steps: daily scheduling (cron or Airflow), incremental runs that start from the last
+loaded date, and alerting on `failed` runs.
 
 ---
 
