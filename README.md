@@ -1,5 +1,7 @@
 # CBAR AZN Exchange Rates — ETL Pipeline
 
+[![CI](https://github.com/nihatgaribli/cbar-etl/actions/workflows/ci.yml/badge.svg)](https://github.com/nihatgaribli/cbar-etl/actions/workflows/ci.yml)
+
 An end-to-end data engineering project. It **extracts** the official daily exchange rates of the
 Azerbaijani manat (AZN) from the Central Bank of the Republic of Azerbaijan (CBAR), **transforms** and
 validates them with Python, **loads** them into PostgreSQL, and serves **SQL analytics** and a
@@ -264,7 +266,7 @@ the other run's open transaction, so the second run starts when the first one co
 ### Run everything with Docker
 
 ```bash
-git clone https://github.com/<your-username>/cbar-etl.git
+git clone https://github.com/nihatgaribli/cbar-etl.git
 cd cbar-etl
 cp .env.example .env                        # optional: defaults work out of the box
 docker compose up -d --build                # postgres + dashboard; etl loads the last 30 days
