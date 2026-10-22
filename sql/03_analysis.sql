@@ -116,7 +116,31 @@ GROUP BY currency_code
 HAVING COUNT(DISTINCT nominal) > 1;
 
 
-\echo '=== 10. Data quality: the largest gaps between consecutive bulletins ==='
+\echo '=== 10. Data quality: currency redenominations under an unchanged code ==='
+SELECT d.currency_code, d.prev_date, d.rate_date, d.prev_rate, d.rate_per_unit,
+       d.change_pct AS adjusted_change_pct, rd.factor, rd.note
+FROM v_daily_change AS d
+JOIN currency_redenominations AS rd ON rd.currency_code = d.currency_code
+WHERE d.across_redenomination;
+
+
+\echo '=== 11. Data quality: isolated spikes in the source data (excluded from analytics) ==='
+SELECT
+    COUNT(*)                                                         AS suspect_rows,
+    COUNT(DISTINCT currency_code)                                    AS currencies,
+    COUNT(DISTINCT rate_date)                                        AS bulletins,
+    ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM exchange_rates), 3) AS pct_of_all_rows
+FROM v_suspect_rates;
+
+SELECT rate_date, COUNT(*) AS currencies_affected,
+       STRING_AGG(currency_code, ', ' ORDER BY currency_code) AS codes
+FROM v_suspect_rates
+GROUP BY rate_date
+ORDER BY currencies_affected DESC, rate_date
+LIMIT 8;
+
+
+\echo '=== 12. Data quality: the largest gaps between consecutive bulletins ==='
 WITH bulletins AS (
     SELECT DISTINCT rate_date FROM exchange_rates
 )
@@ -129,7 +153,7 @@ ORDER BY gap_days DESC NULLS LAST
 LIMIT 10;
 
 
-\echo '=== 11. Data quality: bulletins per year and average currencies per bulletin ==='
+\echo '=== 13. Data quality: bulletins per year and average currencies per bulletin ==='
 SELECT
     EXTRACT(YEAR FROM rate_date)::int                      AS year,
     COUNT(DISTINCT rate_date)                              AS bulletins,
@@ -139,7 +163,7 @@ GROUP BY 1
 ORDER BY 1;
 
 
-\echo '=== 12. Pipeline run history ==='
+\echo '=== 14. Pipeline run history ==='
 SELECT run_id, status, duration, date_from, date_to, bulletins_loaded,
        rows_inserted, rows_updated, rows_unchanged, rows_skipped
 FROM v_etl_runs
