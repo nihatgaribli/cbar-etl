@@ -1,0 +1,9 @@
+[theme]
+# Series slot 1 instead of Streamlit's default red, which reads as an error state
+primaryColor = "#2a78d6"
+
+[client]
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false

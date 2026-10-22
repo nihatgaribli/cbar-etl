@@ -15,6 +15,7 @@ RUN pip install -r requirements.txt
 
 COPY etl/__init__.py etl/config.py etl/
 COPY dashboard/app.py dashboard/
+COPY .streamlit/ .streamlit/
 
 RUN useradd --create-home --uid 1000 app
 USER app

@@ -35,10 +35,24 @@ DARK = {
 }
 THEME = DARK if st.context.theme.type == "dark" else LIGHT
 
-# Fixed entity -> slot mapping, so a currency keeps its color whatever else is selected
-COMPARABLE = ["USD", "EUR", "GBP", "RUB", "TRY", "CNY", "GEL", "XAU"]
+# Fixed entity -> slot mapping, so a currency keeps its color whatever else is selected.
+# The default selection takes slots 1-4, which validate as adjacent pairs.
+COMPARABLE = ["USD", "EUR", "XAU", "RUB", "GBP", "TRY", "CNY", "GEL"]
+DEFAULT_SELECTION = COMPARABLE[:4]
 COLORS = dict(zip(COMPARABLE, THEME["series"], strict=True))
 PERIODS = {"1M": 30, "3M": 91, "1Y": 365, "5Y": 5 * 365, "All": None}
+
+
+def date_axis(frame: pd.DataFrame) -> alt.X:
+    """One tick format for the span actually shown, instead of Vega's mixed multi-level labels."""
+    span = (frame["rate_date"].max() - frame["rate_date"].min()).days if len(frame) else 0
+    if span <= 92:
+        fmt = "%d %b"
+    elif span <= 2 * 365:
+        fmt = "%b %Y"
+    else:
+        fmt = "%Y"
+    return alt.X("rate_date:T", title=None, axis=alt.Axis(format=fmt, labelOverlap=True))
 
 
 def style(chart: alt.Chart, height: int = 320) -> alt.Chart:
@@ -123,7 +137,7 @@ for column, (code, multiplier, label) in zip(st.columns(len(TILES)), TILES, stri
 
 st.subheader("Compare currencies")
 left, middle, right = st.columns([3, 1.3, 1.6])
-codes = left.multiselect("Currencies", COMPARABLE, default=["USD", "EUR", "RUB", "XAU"],
+codes = left.multiselect("Currencies", COMPARABLE, default=DEFAULT_SELECTION,
                          format_func=lambda c: f"{c} · {latest.set_index('code').at[c, 'name_az']}")
 period = middle.segmented_control("Period", list(PERIODS), default="1Y", required=True)
 mode = right.segmented_control("Scale", ["Indexed", "AZN per unit"], default="Indexed",
@@ -140,7 +154,7 @@ if data.empty:
 elif mode == "Indexed":
     color = alt.Color("code:N", scale=alt.Scale(domain=codes, range=[COLORS[c] for c in codes]),
                       legend=alt.Legend(title=None))
-    base = alt.Chart(data).encode(x=alt.X("rate_date:T", title=None))
+    base = alt.Chart(data).encode(x=date_axis(data))
     lines = base.mark_line(strokeWidth=2).encode(
         y=alt.Y("indexed:Q", title=f"Index, {start:%d.%m.%Y} = 100", scale=alt.Scale(zero=False)),
         color=color,
@@ -181,7 +195,7 @@ else:
             f"{code} · AZN per {'troy ounce' if code == 'XAU' else 'unit'}",
             color=THEME["ink"], fontSize=14, anchor="start")
         ).mark_line(strokeWidth=2, color=COLORS[code]).encode(
-            x=alt.X("rate_date:T", title=None),
+            x=date_axis(subset),
             y=alt.Y("rate_per_unit:Q", title=None, scale=alt.Scale(zero=False)),
             tooltip=[alt.Tooltip("rate_date:T", title="Date", format="%d.%m.%Y"),
                      alt.Tooltip("rate_per_unit:Q", title="AZN", format=",.4f")],
@@ -200,7 +214,7 @@ usd = history(["USD"], date(2006, 1, 1))
 shocks = query("SELECT rate_date, prev_rate, rate_per_unit, change_pct FROM v_shocks "
                "WHERE currency_code = 'USD' ORDER BY rate_date")
 usd_line = alt.Chart(usd).mark_line(strokeWidth=2, color=COLORS["USD"]).encode(
-    x=alt.X("rate_date:T", title=None),
+    x=date_axis(usd),
     y=alt.Y("rate_per_unit:Q", title="AZN per USD", scale=alt.Scale(zero=False)),
     tooltip=[alt.Tooltip("rate_date:T", title="Date", format="%d.%m.%Y"),
              alt.Tooltip("rate_per_unit:Q", title="AZN", format=".4f")],
