@@ -1,0 +1,40 @@
+name: cbar-etl
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    command: ["postgres", "-c", "timezone=Asia/Baku"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-etl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl}
+      POSTGRES_DB: ${POSTGRES_DB:-cbar}
+      TZ: Asia/Baku
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot job: loads the last 30 days and exits.
+  # Other ranges: docker compose run --rm etl --from 2015-01-01
+  etl:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      # CBAR publishes by Baku time; "today" must not be computed in UTC
+      TZ: Asia/Baku
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
