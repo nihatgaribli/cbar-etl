@@ -1,6 +1,6 @@
 [project]
 name = "cbar-etl"
-version = "0.1.0"
+version = "1.0.0"
 description = "ETL pipeline for official AZN exchange rates published by the Central Bank of Azerbaijan"
 requires-python = ">=3.12"
 
