@@ -6,7 +6,7 @@ Each test runs in its own throw-away schema. The tests are skipped when no datab
 import os
 import uuid
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -250,4 +250,61 @@ def test_shocks_detect_large_moves(two_bulletins):
     assert conn.execute(shocks).fetchall() == [
         ("USD", Decimal("50.0000")),
         ("XPD", Decimal("-7.0652")),
+    ]
+
+
+def test_daily_change_is_redenomination_aware(two_bulletins):
+    # BYN: 10,000 BYR = 1 BYN on 2016-07-01 (real CBAR values around the switch)
+    conn = two_bulletins
+    conn.execute("""INSERT INTO exchange_rates (currency_code, rate_date, nominal, value)
+                    VALUES ('BYN', '2016-06-30', 100, 0.0077), ('BYN', '2016-07-01', 1, 0.7674)""")
+    change, flag = conn.execute(
+        "SELECT change_pct, across_redenomination FROM v_daily_change "
+        "WHERE currency_code = 'BYN' AND rate_date = '2016-07-01'"
+    ).fetchone()
+    assert change == round(100 * (Decimal("0.7674") / Decimal("0.77") - 1), 4)  # -0.34 %
+    assert flag is True
+    assert scalar(conn, "SELECT count(*) FROM v_shocks "
+                        "WHERE currency_code = 'BYN' AND rate_date = '2016-07-01'") == 0
+
+
+def insert_series(conn, code, values, start=date(2020, 1, 1)):
+    conn.execute(
+        "INSERT INTO currencies VALUES (%s, %s, 'currency', 'unit', %s, %s) "
+        "ON CONFLICT DO NOTHING", (code, code, start, start + timedelta(days=len(values))),
+    )
+    conn.execute(
+        "INSERT INTO exchange_rates (currency_code, rate_date, nominal, value) "
+        "SELECT %s, %s::date + i::int, 1, v FROM unnest(%s::numeric[]) WITH ORDINALITY AS t(v, i)",
+        (code, start - timedelta(days=1), values),
+    )
+
+
+def test_isolated_spike_is_flagged_and_excluded(conn):
+    # like DKK on 2015-08-14: 1567 instead of ~0.156
+    values = [Decimal("0.156")] * 12 + [Decimal("1567")] + [Decimal("0.157")] * 12
+    insert_series(conn, "DKK", values)
+
+    suspects = conn.execute("SELECT rate_date, published_rate FROM v_suspect_rates").fetchall()
+    assert suspects == [(date(2020, 1, 13), Decimal("1567.0000000000"))]
+    # the day after the spike is compared with the last clean rate, not with the spike
+    assert scalar(conn, "SELECT max(abs(change_pct)) FROM v_daily_change") < 1
+    assert scalar(conn, "SELECT count(*) FROM v_shocks") == 0
+
+
+def test_shifted_plateau_is_flagged(conn):
+    # like XAG in April 2009: a wrong value repeated over a weekend
+    values = [Decimal("10")] * 12 + [Decimal("707")] * 3 + [Decimal("10.1")] * 12
+    insert_series(conn, "XAG", values)
+    assert scalar(conn, "SELECT count(*) FROM v_suspect_rates") == 3
+
+
+def test_genuine_level_shift_is_kept(conn):
+    # like USD on 2015-12-21: 1.05 -> 1.55 and it stays there
+    values = [Decimal("1.05")] * 15 + [Decimal("1.55")] * 15
+    insert_series(conn, "USD", values)
+
+    assert scalar(conn, "SELECT count(*) FROM v_suspect_rates") == 0
+    assert conn.execute("SELECT rate_date, change_pct FROM v_shocks").fetchall() == [
+        (date(2020, 1, 16), Decimal("47.6190")),
     ]

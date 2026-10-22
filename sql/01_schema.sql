@@ -29,6 +29,20 @@ COMMENT ON COLUMN exchange_rates.rate_date IS 'ValCurs/@Date of the bulletin, no
 -- The primary key already serves per-currency time series; this index serves per-day lookups.
 CREATE INDEX IF NOT EXISTS ix_exchange_rates_rate_date ON exchange_rates (rate_date);
 
+-- Currencies that CBAR kept under the same code across a redenomination. Rates published before
+-- effective_date are in old units: new unit = factor old units.
+CREATE TABLE IF NOT EXISTS currency_redenominations (
+    currency_code   CHAR(3) PRIMARY KEY,
+    effective_date  DATE    NOT NULL,
+    factor          INTEGER NOT NULL CHECK (factor > 1),
+    note            TEXT
+);
+
+INSERT INTO currency_redenominations (currency_code, effective_date, factor, note) VALUES
+    ('BYN', DATE '2016-07-01', 10000, 'Belarusian ruble: 10,000 BYR = 1 BYN'),
+    ('TMT', DATE '2009-01-13',  5000, 'Turkmen manat: 5,000 TMM = 1 TMT (first CBAR bulletin in new units)')
+ON CONFLICT (currency_code) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS etl_runs (
     run_id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     started_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
