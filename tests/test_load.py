@@ -194,3 +194,57 @@ def test_pipeline_failure_is_logged_and_rolled_back(conn, monkeypatch):
         "failed", "DataError: simulated database error",
     )
     assert scalar(conn, "SELECT count(*) FROM currencies") == 0
+
+
+# --- analytical views ---------------------------------------------------------------------
+
+@pytest.fixture
+def two_bulletins(conn):
+    PostgresLoader(conn).load([
+        bulletin("bulletin_2026-10-16_via_saturday.xml"),
+        bulletin("bulletin_2026-10-22.xml"),
+    ])
+    return conn
+
+
+def test_daily_change_compares_with_previous_bulletin(two_bulletins):
+    conn = two_bulletins
+    prev_date, prev_rate, rate, change = conn.execute(
+        "SELECT prev_date, prev_rate, rate_per_unit, change_pct FROM v_daily_change "
+        "WHERE currency_code = 'EUR' AND rate_date = '2026-10-22'"
+    ).fetchone()
+    assert prev_date == date(2026, 10, 16)
+    assert change == round(100 * (rate / prev_rate - 1), 4)
+
+
+def test_latest_rates_show_newest_bulletin_only(two_bulletins):
+    rows = two_bulletins.execute("SELECT DISTINCT rate_date, count(*) OVER () FROM v_latest_rates")
+    assert rows.fetchall() == [(date(2026, 10, 22), 42)]
+
+
+def test_usd_cross_rates(two_bulletins):
+    eur_usd = scalar(two_bulletins, "SELECT price_in_usd FROM v_usd_cross_rates "
+                                    "WHERE currency_code = 'EUR' AND rate_date = '2026-10-22'")
+    assert eur_usd == round(Decimal("1.9113") / Decimal("1.7"), 6)
+
+
+def test_monthly_summary_open_close(two_bulletins):
+    row = two_bulletins.execute(
+        "SELECT open, close, bulletins FROM v_monthly_summary "
+        "WHERE currency_code = 'USD' AND month = '2026-10-01'"
+    ).fetchone()
+    assert row == (Decimal("1.7"), Decimal("1.7"), 2)
+
+
+def test_shocks_detect_large_moves(two_bulletins):
+    conn = two_bulletins
+    shocks = "SELECT currency_code, change_pct FROM v_shocks ORDER BY currency_code"
+    # real data: palladium fell 7.07 % between the two bulletins
+    assert conn.execute(shocks).fetchall() == [("XPD", Decimal("-7.0652"))]
+
+    conn.execute("UPDATE exchange_rates SET value = value * 1.5 "
+                 "WHERE currency_code = 'USD' AND rate_date = '2026-10-22'")
+    assert conn.execute(shocks).fetchall() == [
+        ("USD", Decimal("50.0000")),
+        ("XPD", Decimal("-7.0652")),
+    ]
