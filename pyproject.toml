@@ -1,0 +1,17 @@
+[project]
+name = "cbar-etl"
+version = "0.1.0"
+description = "ETL pipeline for official AZN exchange rates published by the Central Bank of Azerbaijan"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

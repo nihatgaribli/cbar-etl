@@ -1,0 +1,3 @@
+# Normalize line endings so files behave the same on Windows and inside Linux containers
+* text=auto eol=lf
+*.png binary
