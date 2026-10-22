@@ -68,6 +68,7 @@ class TransformStats:
     bulletins: int = 0
     duplicates: int = 0
     rejected: int = 0
+    pre_denomination: int = 0  # subset of rejected that is expected, see PreDenominationError
     rows: int = 0
     skipped_rows: int = 0
     rejected_dates: list[date] = field(default_factory=list)
@@ -158,9 +159,11 @@ class Transformer:
             try:
                 bulletin = parse_bulletin(raw.content)
             except TransformError as exc:
-                level = logging.WARNING if isinstance(exc, PreDenominationError) else logging.ERROR
-                log.log(level, "Rejected bulletin requested for %s: %s", raw.requested_date, exc)
+                expected = isinstance(exc, PreDenominationError)
+                log.log(logging.WARNING if expected else logging.ERROR,
+                        "Rejected bulletin requested for %s: %s", raw.requested_date, exc)
                 self.stats.rejected += 1
+                self.stats.pre_denomination += expected
                 self.stats.rejected_dates.append(raw.requested_date)
                 continue
 

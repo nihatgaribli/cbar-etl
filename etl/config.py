@@ -28,6 +28,11 @@ class Settings:
     max_retries: int
     retry_backoff: float
     log_level: str
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_user: str = "etl"
+    postgres_password: str = "etl"
+    postgres_db: str = "cbar"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -40,4 +45,18 @@ class Settings:
             max_retries=int(env("MAX_RETRIES", "3")),
             retry_backoff=float(env("RETRY_BACKOFF", "1.0")),
             log_level=env("LOG_LEVEL", "INFO").upper(),
+            postgres_host=env("POSTGRES_HOST", "localhost"),
+            postgres_port=int(env("POSTGRES_PORT", "5432")),
+            postgres_user=env("POSTGRES_USER", "etl"),
+            postgres_password=env("POSTGRES_PASSWORD", "etl"),
+            postgres_db=env("POSTGRES_DB", "cbar"),
         )
+
+    def conninfo(self) -> dict[str, str | int]:
+        return {
+            "host": self.postgres_host,
+            "port": self.postgres_port,
+            "user": self.postgres_user,
+            "password": self.postgres_password,
+            "dbname": self.postgres_db,
+        }
