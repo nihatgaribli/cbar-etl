@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 # Files applied on every run; they must be idempotent (IF NOT EXISTS / CREATE OR REPLACE)
-SCHEMA_FILES = ("01_schema.sql",)
+SCHEMA_FILES = ("01_schema.sql", "02_views.sql")
 
 UPSERT_CURRENCIES = """
 INSERT INTO currencies (code, name_az, category, unit, first_seen, last_seen)
