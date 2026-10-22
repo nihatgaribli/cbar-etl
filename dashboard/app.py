@@ -47,12 +47,22 @@ def date_axis(frame: pd.DataFrame) -> alt.X:
     """One tick format for the span actually shown, instead of Vega's mixed multi-level labels."""
     span = (frame["rate_date"].max() - frame["rate_date"].min()).days if len(frame) else 0
     if span <= 92:
-        fmt = "%d %b"
+        fmt, ticks = "%d %b", {"interval": "week", "step": 1}
     elif span <= 2 * 365:
-        fmt = "%b %Y"
+        fmt, ticks = "%b %Y", {"interval": "month", "step": 1 if span <= 400 else 3}
     else:
-        fmt = "%Y"
-    return alt.X("rate_date:T", title=None, axis=alt.Axis(format=fmt, labelOverlap=True))
+        fmt, ticks = "%Y", {"interval": "year", "step": 1 if span <= 12 * 365 else 2}
+    return alt.X("rate_date:T", title=None,
+                 axis=alt.Axis(format=fmt, tickCount=ticks, labelOverlap=True))
+
+
+def dodge(values: pd.Series, min_gap: float) -> pd.Series:
+    """Spread label positions so that no two are closer than min_gap; order is preserved."""
+    ordered = values.sort_values()
+    positions: list[float] = []
+    for value in ordered:
+        positions.append(value if not positions else max(value, positions[-1] + min_gap))
+    return pd.Series(positions, index=ordered.index).reindex(values.index)
 
 
 def style(chart: alt.Chart, height: int = 320) -> alt.Chart:
@@ -173,16 +183,18 @@ elif mode == "Indexed":
     points = lines.mark_point(size=64, filled=True, stroke=THEME["surface"], strokeWidth=2).encode(
         opacity=alt.condition(hover, alt.value(1), alt.value(0))
     )
-    # Direct labels at the line ends, in ink (the colored end dot carries identity)
-    ends = base.transform_window(
-        rank="rank()", sort=[alt.SortField("rate_date", order="descending")], groupby=["code"]
-    ).transform_filter("datum.rank == 1")
-    end_dots = ends.mark_point(size=64, filled=True, opacity=1).encode(y="indexed:Q", color=color)
-    end_labels = (
-        ends.mark_text(align="left", dx=8, color=THEME["ink_secondary"], fontSize=12)
-        .encode(y="indexed:Q", text=alt.Text("label:N"))
-        .transform_calculate(label="datum.code + ' ' + format(datum.indexed, '.0f')")
-    )
+    # Direct labels at the line ends, in ink (the colored end dot carries identity).
+    # Dots sit on the true value; labels are spread apart so close lines stay readable.
+    ends = data.sort_values("rate_date").groupby("code").tail(1).copy()
+    y_span = data["indexed"].max() - data["indexed"].min()
+    ends["label_y"] = dodge(ends["indexed"], max(y_span, 1) * 0.06)
+    ends["label"] = ends["code"] + " " + ends["indexed"].round().astype(int).astype(str)
+    end_base = alt.Chart(ends).encode(x="rate_date:T")
+    end_dots = end_base.mark_point(size=64, filled=True, opacity=1).encode(
+        y="indexed:Q", color=color)
+    end_labels = end_base.mark_text(
+        align="left", dx=8, color=THEME["ink_secondary"], fontSize=12
+    ).encode(y="label_y:Q", text="label:N")
     chart = alt.layer(lines, crosshair, points, end_dots, end_labels).properties(
         padding={"right": 70}
     )
@@ -232,8 +244,10 @@ if not shocks.empty:
                      alt.Tooltip("prev_rate:Q", title="Before", format=".4f"),
                      alt.Tooltip("rate_per_unit:Q", title="After", format=".4f"),
                      alt.Tooltip("change_pct:Q", title="Change %", format="+.2f")]),
-        marks.mark_text(align="right", dx=-10, dy=-4, color=THEME["ink_secondary"],
-                        fontSize=12).encode(text="label:N"),
+        # Label only the devaluations; smaller shocks keep their dot and tooltip
+        marks.transform_filter("abs(datum.change_pct) >= 10")
+        .mark_text(align="right", dx=-10, dy=-4, color=THEME["ink_secondary"], fontSize=12)
+        .encode(text="label:N"),
     ]
 st.altair_chart(style(alt.layer(*layers), 300), width="stretch")
 if not shocks.empty:
@@ -254,7 +268,8 @@ volatility = query(
 )
 bars = alt.Chart(volatility).encode(
     y=alt.Y("code:N", sort="-x", title=None),
-    x=alt.X("volatility_pct:Q", title="Std. deviation of daily change, %"),
+    x=alt.X("volatility_pct:Q", title="Std. deviation of daily change, %",
+            axis=alt.Axis(tickCount=6)),
     tooltip=[alt.Tooltip("name_az:N", title="Currency"),
              alt.Tooltip("volatility_pct:Q", title="Volatility %", format=".3f")],
 )

@@ -1,6 +1,11 @@
-[theme]
-# Series slot 1 instead of Streamlit's default red, which reads as an error state
+# Series slot 1 instead of Streamlit's default red, which reads as an error state.
+# Separate light/dark sections keep Streamlit following the viewer's system theme;
+# a plain [theme] section would pin the page to light while the charts switch to dark.
+[theme.light]
 primaryColor = "#2a78d6"
+
+[theme.dark]
+primaryColor = "#3987e5"
 
 [client]
 toolbarMode = "viewer"
