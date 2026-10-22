@@ -3,6 +3,7 @@
 Each test runs in its own throw-away schema. The tests are skipped when no database is reachable
 (start one with: docker compose up -d postgres).
 """
+import os
 import uuid
 from dataclasses import replace
 from datetime import date
@@ -32,6 +33,8 @@ def conn():
     try:
         connection = connect(SETTINGS)
     except psycopg.OperationalError as exc:
+        if os.environ.get("REQUIRE_DB"):  # set in CI, so a missing database fails the build
+            pytest.fail(f"PostgreSQL not available: {exc}")
         pytest.skip(f"PostgreSQL not available: {exc}")
     schema = f"test_{uuid.uuid4().hex[:8]}"
     connection.execute(f"CREATE SCHEMA {schema}")
